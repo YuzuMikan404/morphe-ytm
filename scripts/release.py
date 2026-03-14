@@ -15,7 +15,7 @@ APP_LABEL   = "Morphe YouTube Music"
 
 REPO        = os.environ["REPO"]
 GH_TOKEN    = os.environ["GH_TOKEN"]
-MEGA_REMOTE = "mega:"
+MEGA_REMOTE = "mega revancify:"
 
 STATE_PATH = Path(".release_state.json")
 JST        = ZoneInfo("Asia/Tokyo")
