@@ -15,7 +15,7 @@ APP_LABEL   = "Morphe YouTube Music"
 
 REPO        = os.environ["REPO"]
 GH_TOKEN    = os.environ["GH_TOKEN"]
-MEGA_REMOTE = os.environ["MEGA_REMOTE"]  # 例: "mega:/APKフォルダ名"
+MEGA_REMOTE = "mega:"   # ルート直下
 
 STATE_PATH = Path(".release_state.json")
 JST        = ZoneInfo("Asia/Tokyo")
@@ -41,7 +41,7 @@ def list_mega() -> list[tuple[str, int]]:
 
 def download_mega(filename: str, dest: str) -> str:
     r = subprocess.run(
-        ["rclone", "copy", f"{MEGA_REMOTE}/{filename}", dest],
+        ["rclone", "copy", f"{MEGA_REMOTE}{filename}", dest],
         capture_output=True, text=True
     )
     if r.returncode != 0:

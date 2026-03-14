@@ -28,9 +28,8 @@ jobs:
 
       - name: Run release script
         env:
-          GH_TOKEN:    ${{ secrets.GITHUB_TOKEN }}
-          REPO:        ${{ github.repository }}
-          MEGA_REMOTE: ${{ secrets.MEGA_REMOTE }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
         run: python3 scripts/release.py
 
       - name: Commit state
