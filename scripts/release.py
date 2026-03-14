@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-MEGA公開フォルダ → GitHub Release 自動リリーサー
+MEGA公開フォルダ → GitHub Release 自動リリーサー (rclone使用)
 """
 
-import os, re, json, subprocess, tempfile, hashlib, urllib.request, urllib.parse, base64
+import os, re, json, subprocess, tempfile, hashlib, urllib.request, urllib.parse
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -13,72 +13,39 @@ APK_PATTERN = r"YouTube-Music-[\d.]+-Morphe\.apk"
 APP_LABEL   = "Morphe YouTube Music"
 # ────────────────────────────────────────────────────────────
 
-REPO      = os.environ["REPO"]
-GH_TOKEN  = os.environ["GH_TOKEN"]
-MEGA_LINK = "https://mega.nz/folder/A2RE0TwD#JIiV5Sy82y6bH_sMeRNH0Q"
+REPO        = os.environ["REPO"]
+GH_TOKEN    = os.environ["GH_TOKEN"]
+MEGA_REMOTE = os.environ["MEGA_REMOTE"]  # 例: "mega:/APKフォルダ名"
 
 STATE_PATH = Path(".release_state.json")
 JST        = ZoneInfo("Asia/Tokyo")
 
 
-# ── MEGA 公開フォルダ ────────────────────────────────────────
-def _b64dec(s: str) -> bytes:
-    s = s.replace("-", "+").replace("_", "/")
-    return base64.b64decode(s + "=" * (4 - len(s) % 4) % 4)
-
-def _xor(a: bytes, b: bytes) -> bytes:
-    return bytes(x ^ y for x, y in zip(a, (b * (len(a) // len(b) + 1))[:len(a)]))
-
-def _aes_cbc_dec(data: bytes, key: bytes) -> bytes:
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-    from cryptography.hazmat.backends import default_backend
-    c = Cipher(algorithms.AES(key), modes.CBC(b"\x00" * 16), backend=default_backend())
-    d = c.decryptor()
-    return d.update(data) + d.finalize()
-
+# ── MEGA (rclone) ────────────────────────────────────────────
 def list_mega() -> list[tuple[str, int]]:
-    """MEGA APIでファイル一覧を (name, ts) のリストで返す"""
-    path_part  = MEGA_LINK.split("/folder/")[1]
-    folder_id, folder_key_b64 = path_part.split("#", 1)
-    folder_key = _b64dec(folder_key_b64)[:16]
-
-    req_data = json.dumps([{"a": "f", "c": 1, "r": 1, "n": folder_id}]).encode()
-    req = urllib.request.Request(
-        "https://g.api.mega.co.nz/cs",
-        data=req_data, method="POST",
-        headers={"Content-Type": "application/json"},
+    r = subprocess.run(
+        ["rclone", "lsjson", MEGA_REMOTE],
+        capture_output=True, text=True, check=True
     )
-    with urllib.request.urlopen(req) as resp:
-        nodes = json.loads(resp.read())[0].get("f", [])
-
-    files = []  # (name, ts) のリスト
-    for node in nodes:
-        if node.get("t") != 0:   # 0=ファイル, 1=フォルダ
+    files = []
+    for entry in json.loads(r.stdout):
+        if entry.get("IsDir"):
             continue
-        ts = node.get("ts", 0)   # UNIXタイムスタンプ（復号不要）
+        name = entry["Name"]
         try:
-            raw_key  = _b64dec(node["k"].split(":")[1])
-            node_key = _xor(raw_key, folder_key)
-            aes_key  = bytes(
-                node_key[i] ^ node_key[i + 16]
-                for i in range(16)
-            ) if len(node_key) >= 32 else node_key[:16]
-            attr_raw = _aes_cbc_dec(_b64dec(node["a"]), aes_key)
-            attr_str = attr_raw.decode("utf-8", errors="ignore").lstrip("\x00")
-            if attr_str.startswith("MEGA"):
-                name = json.loads(attr_str[4:]).get("n", "")
-                if name:
-                    files.append((name, ts))
-        except Exception as e:
-            print(f"  ⚠️ ノード解析スキップ ({node.get('h','?')}): {e}")
+            ts = int(datetime.fromisoformat(entry.get("ModTime", "")).timestamp())
+        except Exception:
+            ts = 0
+        files.append((name, ts))
     return files
 
 def download_mega(filename: str, dest: str) -> str:
-    """megadl で公開フォルダから特定ファイルをダウンロード"""
-    subprocess.run(
-        ["megadl", "--path", dest, f"{MEGA_LINK}/{filename}"],
-        check=True, timeout=300
+    r = subprocess.run(
+        ["rclone", "copy", f"{MEGA_REMOTE}/{filename}", dest],
+        capture_output=True, text=True
     )
+    if r.returncode != 0:
+        raise RuntimeError(f"rclone copy failed:\n{r.stderr}")
     return os.path.join(dest, filename)
 
 
@@ -88,8 +55,8 @@ def apk_version(path: str) -> str:
         ["aapt", "dump", "badging", path],
         capture_output=True, text=True, check=True
     )
-    vname = re.search(r"versionName='([^']+)'", r.stdout)
-    return vname.group(1) if vname else "0.0.0"
+    m = re.search(r"versionName='([^']+)'", r.stdout)
+    return m.group(1) if m else "0.0.0"
 
 def sha256(path: str) -> str:
     h = hashlib.sha256()
@@ -116,7 +83,8 @@ def existing_tags() -> set[str]:
     try:
         releases = gh("GET", f"/repos/{REPO}/releases?per_page=100")
         return {r["tag_name"] for r in releases}
-    except Exception:
+    except Exception as e:
+        print(f"  ⚠️ タグ一覧取得失敗（継続）: {e}")
         return set()
 
 def create_release(tag: str, title: str, body: str, apk_path: str):
@@ -145,45 +113,42 @@ def main():
     pattern = re.compile(APK_PATTERN, re.IGNORECASE)
     tags    = existing_tags()
 
-    print(f"📡 MEGAファイル一覧取得中...")
+    print("📡 MEGAファイル一覧取得中...")
     all_files = list_mega()
-    print(f"  {len(all_files)} ファイル検出: {[f for f,_ in all_files]}")
+    print(f"  {len(all_files)} ファイル検出: {[f for f, _ in all_files]}")
 
-    # パターンにマッチするファイルを ts 降順でソートして最新を選ぶ
     matched = sorted(
         [(f, ts) for f, ts in all_files if pattern.search(f)],
-        key=lambda x: x[1], reverse=True
+        key=lambda x: x[1], reverse=True,
     )
     if not matched:
         print(f"⚠️  マッチするAPKなし (pattern: {APK_PATTERN})")
         return
 
     latest_name, latest_ts = matched[0]
-    print(f"📦 対象APK: {latest_name}  (MEGA ts: {latest_ts})")
+    print(f"📦 対象APK: {latest_name}  (更新: {datetime.fromtimestamp(latest_ts, JST).strftime('%Y-%m-%d %H:%M JST')})")
 
-    # MEGAのタイムスタンプで更新判定
     last_ts = state.get("file_ts", 0)
     if latest_ts <= last_ts:
         last_dt = datetime.fromtimestamp(last_ts, JST).strftime("%Y-%m-%d %H:%M JST")
-        print(f"✅ 更新なし (ts {latest_ts} ≤ {last_ts} / 前回: {last_dt})")
+        print(f"✅ 更新なし (前回: {last_dt})")
         return
 
     with tempfile.TemporaryDirectory() as tmp:
-        print(f"⬇️  ダウンロード中...")
+        print("⬇️  ダウンロード中...")
         apk = download_mega(latest_name, tmp)
 
         version_name = apk_version(apk)
-        now_jst = datetime.now(JST)
-        tag     = now_jst.strftime("v%Y%m%d-%H%M")
+        now_jst      = datetime.now(JST)
+        tag          = now_jst.strftime("v%Y%m%d-%H%M")
         print(f"🏷️  {tag}  ({version_name})")
 
-        # タグ重複時は分を+1してずらす
         while tag in tags:
             now_jst = now_jst.replace(minute=now_jst.minute + 1)
             tag = now_jst.strftime("v%Y%m%d-%H%M")
 
         mega_updated = datetime.fromtimestamp(latest_ts, JST).strftime("%Y-%m-%d %H:%M JST")
-        checksum = sha256(apk)
+        checksum     = sha256(apk)
         body = "\n".join([
             f"## {APP_LABEL} {version_name}",
             "",
@@ -207,7 +172,7 @@ def main():
             "released_at":  now_jst.isoformat(),
         }
         STATE_PATH.write_text(json.dumps(state, indent=2, ensure_ascii=False))
-        print(f"🎉 完了!")
+        print("🎉 完了!")
 
 if __name__ == "__main__":
     main()

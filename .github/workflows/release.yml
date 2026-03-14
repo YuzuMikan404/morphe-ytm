@@ -19,13 +19,18 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y megatools aapt
-          pip install cryptography --quiet
+          sudo apt-get install -y aapt rclone
+
+      - name: Configure rclone
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "${{ secrets.RCLONE_CONF }}" > ~/.config/rclone/rclone.conf
 
       - name: Run release script
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO:     ${{ github.repository }}
+          GH_TOKEN:    ${{ secrets.GITHUB_TOKEN }}
+          REPO:        ${{ github.repository }}
+          MEGA_REMOTE: ${{ secrets.MEGA_REMOTE }}
         run: python3 scripts/release.py
 
       - name: Commit state
