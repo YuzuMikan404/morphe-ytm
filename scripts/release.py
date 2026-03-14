@@ -3,13 +3,13 @@
 MEGA公開フォルダ → GitHub Release 自動リリーサー
 """
 
-import os, re, json, subprocess, tempfile, hashlib, urllib.request, urllib.parse
+import os, re, json, subprocess, tempfile, hashlib, urllib.request, urllib.parse, base64
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 # ── ★ここだけリポジトリごとに変える ──────────────────────────
-APK_PATTERN = "YouTube-Music-[\d.]+-Morphe\.apk"
+APK_PATTERN = r"YouTube-Music-[\d.]+-Morphe\.apk"
 APP_LABEL   = "Morphe YouTube Music"
 # ────────────────────────────────────────────────────────────
 
@@ -21,34 +21,75 @@ STATE_PATH = Path(".release_state.json")
 JST        = ZoneInfo("Asia/Tokyo")
 
 
-# ── MEGA ────────────────────────────────────────────────────
-def list_mega() -> list[str]:
-    r = subprocess.run(
-        ["megals", "--reload", MEGA_LINK],
-        capture_output=True, text=True, check=True
+# ── MEGA 公開フォルダ ────────────────────────────────────────
+def _b64dec(s: str) -> bytes:
+    s = s.replace("-", "+").replace("_", "/")
+    return base64.b64decode(s + "=" * (4 - len(s) % 4) % 4)
+
+def _xor(a: bytes, b: bytes) -> bytes:
+    return bytes(x ^ y for x, y in zip(a, (b * (len(a) // len(b) + 1))[:len(a)]))
+
+def _aes_cbc_dec(data: bytes, key: bytes) -> bytes:
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.backends import default_backend
+    c = Cipher(algorithms.AES(key), modes.CBC(b"\x00" * 16), backend=default_backend())
+    d = c.decryptor()
+    return d.update(data) + d.finalize()
+
+def list_mega() -> list[tuple[str, int]]:
+    """MEGA APIでファイル一覧を (name, ts) のリストで返す"""
+    path_part  = MEGA_LINK.split("/folder/")[1]
+    folder_id, folder_key_b64 = path_part.split("#", 1)
+    folder_key = _b64dec(folder_key_b64)[:16]
+
+    req_data = json.dumps([{"a": "f", "c": 1, "r": 1, "n": folder_id}]).encode()
+    req = urllib.request.Request(
+        "https://g.api.mega.co.nz/cs",
+        data=req_data, method="POST",
+        headers={"Content-Type": "application/json"},
     )
-    return [line.split("/")[-1].strip() for line in r.stdout.splitlines() if line.strip()]
+    with urllib.request.urlopen(req) as resp:
+        nodes = json.loads(resp.read())[0].get("f", [])
+
+    files = []  # (name, ts) のリスト
+    for node in nodes:
+        if node.get("t") != 0:   # 0=ファイル, 1=フォルダ
+            continue
+        ts = node.get("ts", 0)   # UNIXタイムスタンプ（復号不要）
+        try:
+            raw_key  = _b64dec(node["k"].split(":")[1])
+            node_key = _xor(raw_key, folder_key)
+            aes_key  = bytes(
+                node_key[i] ^ node_key[i + 16]
+                for i in range(16)
+            ) if len(node_key) >= 32 else node_key[:16]
+            attr_raw = _aes_cbc_dec(_b64dec(node["a"]), aes_key)
+            attr_str = attr_raw.decode("utf-8", errors="ignore").lstrip("\x00")
+            if attr_str.startswith("MEGA"):
+                name = json.loads(attr_str[4:]).get("n", "")
+                if name:
+                    files.append((name, ts))
+        except Exception as e:
+            print(f"  ⚠️ ノード解析スキップ ({node.get('h','?')}): {e}")
+    return files
 
 def download_mega(filename: str, dest: str) -> str:
+    """megadl で公開フォルダから特定ファイルをダウンロード"""
     subprocess.run(
-        ["megaget", "--path", dest, f"{MEGA_LINK}/{filename}"],
-        check=True
+        ["megadl", "--path", dest, f"{MEGA_LINK}/{filename}"],
+        check=True, timeout=300
     )
     return os.path.join(dest, filename)
 
 
 # ── APK 情報 ────────────────────────────────────────────────
-def apk_info(path: str) -> tuple[str, int]:
+def apk_version(path: str) -> str:
     r = subprocess.run(
         ["aapt", "dump", "badging", path],
         capture_output=True, text=True, check=True
     )
     vname = re.search(r"versionName='([^']+)'", r.stdout)
-    vcode = re.search(r"versionCode='([^']+)'", r.stdout)
-    return (
-        vname.group(1) if vname else "0.0.0",
-        int(vcode.group(1)) if vcode else 0,
-    )
+    return vname.group(1) if vname else "0.0.0"
 
 def sha256(path: str) -> str:
     h = hashlib.sha256()
@@ -105,38 +146,43 @@ def main():
     tags    = existing_tags()
 
     print(f"📡 MEGAファイル一覧取得中...")
-    files = list_mega()
-    print(f"  {len(files)} ファイル検出")
+    all_files = list_mega()
+    print(f"  {len(all_files)} ファイル検出: {[f for f,_ in all_files]}")
 
-    matched = sorted([f for f in files if pattern.search(f)])
+    # パターンにマッチするファイルを ts 降順でソートして最新を選ぶ
+    matched = sorted(
+        [(f, ts) for f, ts in all_files if pattern.search(f)],
+        key=lambda x: x[1], reverse=True
+    )
     if not matched:
         print(f"⚠️  マッチするAPKなし (pattern: {APK_PATTERN})")
-        print(f"   ファイル一覧: {files}")
         return
 
-    latest = matched[-1]
-    print(f"📦 対象APK: {latest}")
+    latest_name, latest_ts = matched[0]
+    print(f"📦 対象APK: {latest_name}  (MEGA ts: {latest_ts})")
+
+    # MEGAのタイムスタンプで更新判定
+    last_ts = state.get("file_ts", 0)
+    if latest_ts <= last_ts:
+        last_dt = datetime.fromtimestamp(last_ts, JST).strftime("%Y-%m-%d %H:%M JST")
+        print(f"✅ 更新なし (ts {latest_ts} ≤ {last_ts} / 前回: {last_dt})")
+        return
 
     with tempfile.TemporaryDirectory() as tmp:
         print(f"⬇️  ダウンロード中...")
-        apk = download_mega(latest, tmp)
+        apk = download_mega(latest_name, tmp)
 
-        version_name, version_code = apk_info(apk)
+        version_name = apk_version(apk)
         now_jst = datetime.now(JST)
         tag     = now_jst.strftime("v%Y%m%d-%H%M")
-        print(f"🏷️  {tag}  ({version_name} / versionCode: {version_code})")
-
-        # versionCode で更新判定
-        last_code = state.get("version_code", 0)
-        if version_code <= last_code:
-            print(f"✅ 更新なし (versionCode {version_code} ≤ {last_code})")
-            return
+        print(f"🏷️  {tag}  ({version_name})")
 
         # タグ重複時は分を+1してずらす
         while tag in tags:
             now_jst = now_jst.replace(minute=now_jst.minute + 1)
             tag = now_jst.strftime("v%Y%m%d-%H%M")
 
+        mega_updated = datetime.fromtimestamp(latest_ts, JST).strftime("%Y-%m-%d %H:%M JST")
         checksum = sha256(apk)
         body = "\n".join([
             f"## {APP_LABEL} {version_name}",
@@ -144,10 +190,10 @@ def main():
             "| 項目 | 値 |",
             "|---|---|",
             f"| versionName | `{version_name}` |",
-            f"| versionCode | `{version_code}` |",
-            f"| ファイル名 | `{latest}` |",
+            f"| ファイル名 | `{latest_name}` |",
+            f"| MEGA更新日時 | `{mega_updated}` |",
             f"| SHA-256 | `{checksum}` |",
-            f"| 更新日時 | {now_jst.strftime('%Y-%m-%d %H:%M JST')} |",
+            f"| リリース日時 | {now_jst.strftime('%Y-%m-%d %H:%M JST')} |",
         ])
 
         print(f"🚀 リリース作成中: {tag}")
@@ -155,9 +201,9 @@ def main():
 
         state = {
             "version_name": version_name,
-            "version_code": version_code,
+            "file_ts":      latest_ts,
             "tag":          tag,
-            "filename":     latest,
+            "filename":     latest_name,
             "released_at":  now_jst.isoformat(),
         }
         STATE_PATH.write_text(json.dumps(state, indent=2, ensure_ascii=False))
