@@ -28,7 +28,7 @@ jobs:
           echo "--- rclone config check ---"
           rclone listremotes
           echo "--- MEGA connection test ---"
-          rclone lsd mega: --verbose || { echo "❌ MEGA接続失敗"; exit 1; }
+          rclone lsd "mega revancify:" --verbose || { echo "❌ MEGA接続失敗"; exit 1; }
 
       - name: Run release script
         env:
