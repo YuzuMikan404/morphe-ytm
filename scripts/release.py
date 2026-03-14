@@ -28,9 +28,12 @@ def list_mega() -> list[tuple[str, int]]:
         capture_output=True, text=True
     )
     print(f"  rclone stdout: {r.stdout[:500]}")
-    print(f"  rclone stderr: {r.stderr[:500]}")
+    print(f"  rclone stderr: {r.stderr[:1000]}")  # ← 500→1000に拡大
     if r.returncode != 0:
-        raise RuntimeError(f"rclone lsjson failed (exit {r.returncode})")
+        raise RuntimeError(
+            f"rclone lsjson failed (exit {r.returncode})\n"
+            f"stderr: {r.stderr}"
+        )
     files = []
     for entry in json.loads(r.stdout):
         if entry.get("IsDir"):
@@ -48,6 +51,7 @@ def download_mega(filename: str, dest: str) -> str:
         ["rclone", "copy", f"{MEGA_REMOTE}{filename}", dest],
         capture_output=True, text=True
     )
+    print(f"  rclone stderr: {r.stderr[:1000]}")
     if r.returncode != 0:
         raise RuntimeError(f"rclone copy failed:\n{r.stderr}")
     return os.path.join(dest, filename)
