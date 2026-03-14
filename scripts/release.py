@@ -15,7 +15,7 @@ APP_LABEL   = "Morphe YouTube Music"
 
 REPO        = os.environ["REPO"]
 GH_TOKEN    = os.environ["GH_TOKEN"]
-MEGA_REMOTE = "mega:"   # ルート直下
+MEGA_REMOTE = "mega:"
 
 STATE_PATH = Path(".release_state.json")
 JST        = ZoneInfo("Asia/Tokyo")
@@ -24,9 +24,13 @@ JST        = ZoneInfo("Asia/Tokyo")
 # ── MEGA (rclone) ────────────────────────────────────────────
 def list_mega() -> list[tuple[str, int]]:
     r = subprocess.run(
-        ["rclone", "lsjson", MEGA_REMOTE],
-        capture_output=True, text=True, check=True
+        ["rclone", "lsjson", "--verbose", MEGA_REMOTE],
+        capture_output=True, text=True
     )
+    print(f"  rclone stdout: {r.stdout[:500]}")
+    print(f"  rclone stderr: {r.stderr[:500]}")
+    if r.returncode != 0:
+        raise RuntimeError(f"rclone lsjson failed (exit {r.returncode})")
     files = []
     for entry in json.loads(r.stdout):
         if entry.get("IsDir"):
